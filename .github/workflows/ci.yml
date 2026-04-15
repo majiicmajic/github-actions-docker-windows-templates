@@ -1,0 +1,10 @@
+name: Node.js CI
+on: [push]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: yourusername/github-actions-docker-windows-templates/composites/setup-windows-docker@main
+      - run: docker build -t node-app .
+      - run: docker run --rm node-app node -e "console.log('OK')"

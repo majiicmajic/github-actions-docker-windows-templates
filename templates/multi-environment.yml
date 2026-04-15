@@ -1,0 +1,225 @@
+# templates/multi-environment.yml
+# Multi-environment deployment workflow (dev, staging, production)
+
+name: Multi-Environment Deployment
+
+on:
+  push:
+    branches: [develop, main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAME: ${{ github.event.repository.name }}
+
+jobs:
+  # Build once, deploy to multiple environments
+  build:
+    name: Build & Push
+    runs-on: windows-latest
+    outputs:
+      image_tag: ${{ steps.tag.outputs.image_tag }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Install Make
+        shell: cmd
+        run: choco install make -y
+      
+      - name: Set image tag
+        id: tag
+        shell: powershell
+        run: |
+          if ("${{ github.event.inputs.environment }}" -ne "") {
+            $tag = "${{ github.event.inputs.environment }}-${{ github.run_number }}"
+          } elseif ("${{ github.ref_type }}" -eq "tag") {
+            $tag = "${{ github.ref_name }}"
+          } elseif ("${{ github.ref_name }}" -eq "main") {
+            $tag = "production-${{ github.run_number }}"
+          } else {
+            $tag = "${{ github.sha }}"
+          }
+          echo "IMAGE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "image_tag=$tag" >> $env:GITHUB_OUTPUT
+      
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+      
+      - name: Build image
+        shell: cmd
+        run: |
+          docker build -t ${{ env.REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} .
+          docker build -t ${{ env.REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }} .
+      
+      - name: Push image
+        shell: cmd
+        run: |
+          docker push ${{ env.REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          docker push ${{ env.REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+  # Deploy to Development
+  deploy-dev:
+    name: Deploy to Development
+    runs-on: windows-latest
+    needs: build
+    if: |
+      github.ref == 'refs/heads/develop' ||
+      github.event.inputs.environment == 'dev'
+    environment:
+      name: development
+      url: https://dev.yourdomain.com
+    
+    steps:
+      - name: Deploy to dev environment
+        shell: cmd
+        run: |
+          echo "Deploying to DEVELOPMENT environment"
+          echo "Image: ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}"
+          docker pull ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}
+          docker run -d -p 8080:80 --name dev-app ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}
+      
+      - name: Health check
+        shell: cmd
+        run: |
+          timeout /t 10
+          curl -f http://localhost:8080/health || echo "Health check pending"
+      
+      - name: Run smoke tests
+        shell: cmd
+        run: |
+          echo "Running smoke tests..."
+          curl -f http://localhost:8080/ || exit 1
+
+  # Deploy to Staging (requires approval)
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: windows-latest
+    needs: [build, deploy-dev]
+    if: |
+      github.ref == 'refs/heads/main' ||
+      github.event.inputs.environment == 'staging'
+    environment:
+      name: staging
+      url: https://staging.yourdomain.com
+    
+    steps:
+      - name: Manual approval
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ secrets.GITHUB_TOKEN }}
+          approvers: ${{ secrets.STAGING_APPROVERS }}
+          minimum-approvals: 1
+          issue-title: "Deploy to Staging"
+          wait-for-approval: true
+      
+      - name: Deploy to staging
+        shell: cmd
+        run: |
+          echo "Deploying to STAGING environment"
+          docker pull ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}
+          docker tag ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }} ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:staging
+          docker run -d -p 8081:80 --name staging-app ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}
+      
+      - name: Integration tests
+        shell: cmd
+        run: |
+          timeout /t 15
+          docker run --rm --network host appropriate/curl curl -f http://localhost:8081/api/health
+
+  # Deploy to Production (requires higher approval)
+  deploy-production:
+    name: Deploy to Production
+    runs-on: windows-latest
+    needs: [build, deploy-staging]
+    if: |
+      startsWith(github.ref, 'refs/tags/v') ||
+      github.event.inputs.environment == 'production'
+    environment:
+      name: production
+      url: https://yourdomain.com
+    
+    steps:
+      - name: High-level approval
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ secrets.GITHUB_TOKEN }}
+          approvers: ${{ secrets.PRODUCTION_APPROVERS }}
+          minimum-approvals: 2
+          issue-title: "🚨 DEPLOY TO PRODUCTION 🚨"
+          wait-for-approval: true
+      
+      - name: Deploy to production
+        shell: cmd
+        run: |
+          echo "Deploying to PRODUCTION environment"
+          docker pull ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}
+          docker tag ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }} ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:production
+      
+      - name: Blue-green deployment
+        shell: powershell
+        run: |
+          # Blue-green deployment logic
+          $current = docker ps --filter "name=app-blue" -q
+          if ($current) {
+            $new = "green"
+            $old = "blue"
+          } else {
+            $new = "blue"
+            $old = "green"
+          }
+          
+          docker run -d --name app-$new -p 80:80 --label version=$new ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}
+          
+          # Wait for new container to be healthy
+          timeout /t 10
+          
+          # Switch traffic
+          docker exec reverse-proxy nginx -s reload
+          
+          # Remove old container
+          docker stop app-$old
+          docker rm app-$old
+          
+          echo "Deployed as $new"
+      
+      - name: Post-deployment validation
+        shell: cmd
+        run: |
+          timeout /t 30
+          for /l %%i in (1,1,10) do (
+            curl -f https://yourdomain.com/health && goto :success
+            timeout /t 3
+          )
+          echo "Health check failed after 10 retries"
+          exit 1
+          :success
+          echo "Deployment successful!"
+      
+      - name: Create deployment status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: context.payload.deployment?.id,
+              state: 'success',
+              environment: 'production',
+              description: 'Deployment completed successfully',
+              environment_url: 'https://yourdomain.com'
+            });

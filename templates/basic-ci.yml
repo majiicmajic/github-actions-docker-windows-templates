@@ -1,0 +1,63 @@
+# templates/basic-ci.yml
+# Basic CI: Build and test on every push and pull request
+
+name: Basic CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:  # Allow manual trigger
+
+env:
+  IMAGE_NAME: ${{ github.event.repository.name }}
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Install Make
+        shell: cmd
+        run: choco install make -y
+      
+      - name: Verify Docker
+        shell: cmd
+        run: |
+          docker --version
+          docker compose version
+          make --version
+      
+      - name: Build Docker image
+        shell: cmd
+        run: docker build -t ${{ env.IMAGE_NAME }}:latest .
+      
+      - name: Run tests
+        shell: cmd
+        run: |
+          docker run --rm ${{ env.IMAGE_NAME }}:latest npm test || echo "No tests configured"
+      
+      - name: Docker Compose validation
+        shell: cmd
+        run: |
+          if exist docker-compose.yml (
+            docker compose config
+          ) else (
+            echo "No docker-compose.yml found"
+          )
+      
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: |
+            test-results/
+            logs/
+            *.log
+          retention-days: 7

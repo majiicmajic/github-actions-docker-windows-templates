@@ -1,0 +1,113 @@
+# composites/build-and-push/action.yml
+name: 'Build and Push Docker Image'
+description: 'Builds Docker image and pushes to container registry'
+
+inputs:
+  image-tag:
+    description: 'Tag for the Docker image'
+    required: true
+    default: 'latest'
+  registry:
+    description: 'Container registry (docker.io, ghcr.io, etc.)'
+    required: false
+    default: 'docker.io'
+  registry-namespace:
+    description: 'Registry namespace/username'
+    required: false
+    default: ''
+  image-name:
+    description: 'Image name (defaults to repository name)'
+    required: false
+    default: ''
+  dockerfile:
+    description: 'Path to Dockerfile'
+    required: false
+    default: 'Dockerfile'
+  build-args:
+    description: 'Build arguments (comma-separated: KEY1=value1,KEY2=value2)'
+    required: false
+    default: ''
+  push-latest:
+    description: 'Also push as latest tag'
+    required: false
+    default: 'true'
+  platforms:
+    description: 'Target platforms (comma-separated: linux/amd64,windows/amd64)'
+    required: false
+    default: ''
+
+outputs:
+  image:
+    description: 'Full image name with tag'
+    value: ${{ steps.build.outputs.image }}
+  digest:
+    description: 'Image digest'
+    value: ${{ steps.build.outputs.digest }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set defaults
+      id: defaults
+      shell: powershell
+      run: |
+        $imageName = "${{ inputs.image-name }}"
+        if ([string]::IsNullOrEmpty($imageName)) {
+          $imageName = "${{ github.event.repository.name }}"
+        }
+        
+        $namespace = "${{ inputs.registry-namespace }}"
+        if ([string]::IsNullOrEmpty($namespace)) {
+          $namespace = "${{ secrets.DOCKER_USERNAME }}"
+        }
+        
+        echo "IMAGE_NAME=$imageName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        echo "NAMESPACE=$namespace" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+    
+    - name: Login to registry
+      shell: cmd
+      run: |
+        if "${{ inputs.registry }}" == "docker.io" (
+          echo ${{ secrets.DOCKER_TOKEN }} | docker login --username ${{ secrets.DOCKER_USERNAME }} --password-stdin
+        ) else if "${{ inputs.registry }}" == "ghcr.io" (
+          echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io --username ${{ github.actor }} --password-stdin
+        ) else (
+          echo "Please ensure you're logged into ${{ inputs.registry }}"
+        )
+    
+    - name: Build image
+      id: build
+      shell: cmd
+      run: |
+        set FULL_IMAGE=${{ inputs.registry }}/%NAMESPACE%/%IMAGE_NAME%:${{ inputs.image-tag }}
+        
+        echo Building %FULL_IMAGE%
+        
+        if "${{ inputs.build-args }}" == "" (
+          docker build -f ${{ inputs.dockerfile }} -t %FULL_IMAGE% .
+        ) else (
+          set BUILD_ARGS=${{ inputs.build-args }}
+          docker build -f ${{ inputs.dockerfile }} -t %FULL_IMAGE% --build-arg %BUILD_ARGS:, = --build-arg % .
+        )
+        
+        echo "image=%FULL_IMAGE%" >> %GITHUB_OUTPUT%
+        
+        :: Get digest
+        docker inspect %FULL_IMAGE% --format="{{.Id}}" > digest.txt
+        set /p DIGEST=<digest.txt
+        echo "digest=%DIGEST%" >> %GITHUB_OUTPUT%
+    
+    - name: Push image
+      shell: cmd
+      run: |
+        docker push ${{ steps.build.outputs.image }}
+        echo "Pushed: ${{ steps.build.outputs.image }}"
+    
+    - name: Push latest tag
+      if: inputs.push-latest == 'true' && inputs.image-tag != 'latest'
+      shell: cmd
+      run: |
+        set LATEST_IMAGE=${{ inputs.registry }}/%NAMESPACE%/%IMAGE_NAME%:latest
+        docker tag ${{ steps.build.outputs.image }} %LATEST_IMAGE%
+        docker push %LATEST_IMAGE%
+        echo "Also pushed: %LATEST_IMAGE%"

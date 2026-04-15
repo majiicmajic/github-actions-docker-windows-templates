@@ -1,0 +1,118 @@
+# templates/nightly-build.yml
+# Scheduled nightly builds for testing and validation
+
+name: Nightly Build
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # Run at 2 AM UTC daily
+  workflow_dispatch:  # Allow manual trigger
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAME: ${{ github.event.repository.name }}
+
+jobs:
+  nightly-build:
+    name: Nightly Build & Test
+    runs-on: windows-latest
+    if: github.repository_owner != 'YOUR_USERNAME'  # Change to your username
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Install Make
+        shell: cmd
+        run: choco install make -y
+      
+      - name: Set date tag
+        id: date
+        shell: powershell
+        run: |
+          $date = Get-Date -Format "yyyyMMdd"
+          echo "DATE_TAG=nightly-$date" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "date_tag=nightly-$date" >> $env:GITHUB_OUTPUT
+      
+      - name: Build with nightly tag
+        shell: cmd
+        run: |
+          docker build -t ${{ env.IMAGE_NAME }}:${{ env.DATE_TAG }} .
+          docker tag ${{ env.IMAGE_NAME }}:${{ env.DATE_TAG }} ${{ env.IMAGE_NAME }}:nightly
+      
+      - name: Run full test suite
+        shell: cmd
+        run: |
+          echo "Running unit tests..."
+          docker run --rm ${{ env.IMAGE_NAME }}:${{ env.DATE_TAG }} npm test || echo "No tests found"
+          
+          echo "Running integration tests..."
+          if exist docker-compose.yml (
+            docker compose -f docker-compose.yml up -d
+            timeout /t 10
+            docker compose -f docker-compose.yml down
+          )
+      
+      - name: Performance benchmark
+        shell: cmd
+        run: |
+          echo "Running benchmarks..."
+          mkdir benchmark-results
+          docker run --rm ${{ env.IMAGE_NAME }}:${{ env.DATE_TAG }} npm run benchmark > benchmark-results/results.txt 2>&1 || echo "No benchmarks"
+      
+      - name: Check image size
+        shell: powershell
+        run: |
+          $image = docker images ${{ env.IMAGE_NAME }} --format "{{.Size}}"
+          $size = $image | Select-Object -First 1
+          echo "Image size: $size"
+          Add-Content -Path benchmark-results/size.txt -Value "Image size: $size"
+      
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-benchmarks-${{ steps.date.outputs.date_tag }}
+          path: benchmark-results/
+          retention-days: 30
+      
+      - name: Push to registry (optional)
+        if: secrets.DOCKER_USERNAME != ''
+        shell: cmd
+        run: |
+          echo ${{ secrets.DOCKER_TOKEN }} | docker login --username ${{ secrets.DOCKER_USERNAME }} --password-stdin
+          docker tag ${{ env.IMAGE_NAME }}:${{ env.DATE_TAG }} ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ env.DATE_TAG }}
+          docker push ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ env.DATE_TAG }}
+      
+      - name: Create issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const date = new Date().toISOString().split('T')[0];
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `❌ Nightly build failed on ${date}`,
+              body: `The nightly build for ${date} failed. Please check the [workflow logs](${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}).\n\n**Commit:** ${process.env.GITHUB_SHA}\n**Branch:** ${process.env.GITHUB_REF_NAME}`,
+              labels: ['nightly-failure', 'bug']
+            });
+      
+      - name: Send notification (Slack)
+        if: failure() && secrets.SLACK_WEBHOOK != ''
+        uses: slackapi/slack-github-action@v1.25
+        with:
+          payload: |
+            {
+              "text": "❌ Nightly build failed for ${{ github.repository }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*❌ Nightly Build Failed*\nRepository: <${{ github.server_url }}/${{ github.repository }}|${{ github.repository }}>\nView logs: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Click here>"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}

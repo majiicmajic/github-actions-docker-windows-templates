@@ -1,0 +1,90 @@
+# composites/health-check/action.yml
+name: 'Container Health Check'
+description: 'Wait for container to become healthy with retries'
+
+inputs:
+  container-name:
+    description: 'Name of the container to check'
+    required: true
+  max-retries:
+    description: 'Maximum number of retries'
+    required: false
+    default: '30'
+  retry-delay:
+    description: 'Delay between retries in seconds'
+    required: false
+    default: '2'
+  health-endpoint:
+    description: 'HTTP endpoint to check (optional)'
+    required: false
+    default: ''
+
+outputs:
+  healthy:
+    description: 'Whether container is healthy'
+    value: ${{ steps.check.outputs.healthy }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Check container health
+      id: check
+      shell: powershell
+      run: |
+        $containerName = "${{ inputs.container-name }}"
+        $maxRetries = [int]"${{ inputs.max-retries }}"
+        $delay = [int]"${{ inputs.retry-delay }}"
+        $retryCount = 0
+        $healthy = $false
+        
+        Write-Host "Waiting for container '$containerName' to become healthy..."
+        
+        while ($retryCount -lt $maxRetries) {
+          $retryCount++
+          
+          # Check Docker health status
+          $inspect = docker inspect $containerName --format="{{json .State.Health}}" | ConvertFrom-Json
+          
+          if ($inspect.Status -eq "healthy") {
+            Write-Host "✅ Container '$containerName' is healthy!"
+            $healthy = $true
+            break
+          }
+          
+          # Check if container is running
+          $state = docker inspect $containerName --format="{{.State.Status}}"
+          if ($state -ne "running") {
+            Write-Host "❌ Container '$containerName' is not running (Status: $state)"
+            break
+          }
+          
+          Write-Host "⏳ Waiting for container to become healthy... ($retryCount/$maxRetries)"
+          Start-Sleep -Seconds $delay
+        }
+        
+        # Optional HTTP endpoint check
+        if ($healthy -and "${{ inputs.health-endpoint }}" -ne "") {
+          Write-Host "Checking HTTP endpoint: ${{ inputs.health-endpoint }}"
+          $httpRetries = 0
+          while ($httpRetries -lt 10) {
+            try {
+              $response = Invoke-WebRequest -Uri "${{ inputs.health-endpoint }}" -UseBasicParsing -TimeoutSec 5
+              if ($response.StatusCode -eq 200) {
+                Write-Host "✅ HTTP endpoint is healthy"
+                break
+              }
+            } catch {
+              Write-Host "⏳ Waiting for HTTP endpoint... ($httpRetries/10)"
+            }
+            $httpRetries++
+            Start-Sleep -Seconds 2
+          }
+        }
+        
+        echo "healthy=$healthy" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+        
+        if (-not $healthy) {
+          Write-Host "Container logs:"
+          docker logs $containerName --tail 50
+          exit 1
+        }

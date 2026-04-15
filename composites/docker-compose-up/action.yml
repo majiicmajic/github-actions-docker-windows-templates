@@ -1,0 +1,103 @@
+# composites/docker-compose-up/action.yml
+name: 'Docker Compose Up'
+description: 'Start services with Docker Compose and wait for them to be ready'
+
+inputs:
+  compose-file:
+    description: 'Docker Compose file path'
+    required: false
+    default: 'docker-compose.yml'
+  services:
+    description: 'Specific services to start (comma-separated)'
+    required: false
+    default: ''
+  wait-for-healthy:
+    description: 'Wait for containers to be healthy'
+    required: false
+    default: 'true'
+  timeout:
+    description: 'Timeout in seconds'
+    required: false
+    default: '60'
+
+outputs:
+  services-started:
+    description: 'List of started services'
+    value: ${{ steps.start.outputs.services }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate compose file
+      id: validate
+      shell: cmd
+      run: |
+        if not exist "${{ inputs.compose-file }}" (
+          echo "❌ Compose file not found: ${{ inputs.compose-file }}"
+          exit 1
+        )
+        docker compose -f ${{ inputs.compose-file }} config > nul
+        if errorlevel 1 (
+          echo "❌ Invalid compose file"
+          exit 1
+        )
+    
+    - name: Start services
+      id: start
+      shell: cmd
+      run: |
+        set SERVICES=${{ inputs.services }}
+        if "%SERVICES%"=="" (
+          echo "Starting all services..."
+          docker compose -f ${{ inputs.compose-file }} up -d
+          docker compose -f ${{ inputs.compose-file }} ps --format "table {{.Name}}" > services.txt
+        ) else (
+          echo "Starting services: %SERVICES%"
+          docker compose -f ${{ inputs.compose-file }} up -d %SERVICES%
+          echo %SERVICES% > services.txt
+        )
+        
+        :: Get list of services
+        set /p SERVICE_LIST=<services.txt
+        echo "services=%SERVICE_LIST%" >> %GITHUB_OUTPUT%
+    
+    - name: Wait for containers
+      if: inputs.wait-for-healthy == 'true'
+      shell: powershell
+      run: |
+        $timeout = [int]"${{ inputs.timeout }}"
+        $startTime = Get-Date
+        
+        Write-Host "Waiting up to $timeout seconds for containers to be healthy..."
+        
+        while ((Get-Date) - $startTime -lt [TimeSpan]::FromSeconds($timeout)) {
+          $allHealthy = $true
+          $containers = docker ps --filter "status=running" --format "{{.Names}}"
+          
+          foreach ($container in $containers) {
+            $health = docker inspect $container --format="{{.State.Health.Status}}" 2>$null
+            if ($health -and $health -ne "healthy") {
+              $allHealthy = $false
+              Write-Host "⏳ Waiting for $container (Status: $health)"
+            }
+          }
+          
+          if ($allHealthy) {
+            Write-Host "✅ All containers are healthy!"
+            exit 0
+          }
+          
+          Start-Sleep -Seconds 2
+        }
+        
+        Write-Host "⚠️ Timeout waiting for containers to become healthy"
+    
+    - name: Show status
+      shell: cmd
+      run: |
+        echo ""
+        echo "========================================"
+        echo "Container Status:"
+        echo "========================================"
+        docker compose -f ${{ inputs.compose-file }} ps
+        echo "========================================"

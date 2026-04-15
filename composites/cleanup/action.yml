@@ -1,0 +1,85 @@
+# composites/cleanup/action.yml
+name: 'Cleanup Docker Resources'
+description: 'Clean up Docker containers, images, and volumes'
+
+inputs:
+  remove-all:
+    description: 'Remove all unused resources (aggressive)'
+    required: false
+    default: 'false'
+  remove-volumes:
+    description: 'Also remove volumes'
+    required: false
+    default: 'false'
+  keep-recent:
+    description: 'Number of recent images to keep'
+    required: false
+    default: '5'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Stop and remove containers
+      shell: cmd
+      run: |
+        echo "Stopping and removing containers..."
+        docker container prune -f
+        
+        if "${{ inputs.remove-all }}" == "true" (
+          docker stop $(docker ps -aq) 2>nul || echo "No containers to stop"
+          docker rm $(docker ps -aq) 2>nul || echo "No containers to remove"
+        )
+    
+    - name: Remove images
+      shell: powershell
+      run: |
+        if ("${{ inputs.remove-all }}" -eq "true") {
+          Write-Host "Removing all unused images..."
+          docker image prune -a -f
+        } else {
+          Write-Host "Removing dangling images..."
+          docker image prune -f
+          
+          # Keep recent images
+          $keepCount = [int]"${{ inputs.keep-recent }}"
+          $images = docker images --format "{{.Repository}}:{{.Tag}} {{.CreatedAt}}" | Sort-Object -Property { $_ -split ' ' | Select-Object -Last 1 } -Descending
+          $toRemove = $images | Select-Object -Skip $keepCount
+          
+          foreach ($image in $toRemove) {
+            $imageName = ($image -split ' ')[0]
+            if ($imageName -ne "<none>:<none>") {
+              docker rmi $imageName 2>$null
+            }
+          }
+        }
+    
+    - name: Remove volumes
+      if: inputs.remove-volumes == 'true'
+      shell: cmd
+      run: |
+        echo "Removing volumes..."
+        docker volume prune -f
+        
+        if "${{ inputs.remove-all }}" == "true" (
+          docker volume rm $(docker volume ls -q) 2>nul || echo "No volumes to remove"
+        )
+    
+    - name: Clean build cache
+      shell: cmd
+      run: |
+        echo "Cleaning build cache..."
+        docker builder prune -f
+        
+        if "${{ inputs.remove-all }}" == "true" (
+          docker builder prune -a -f
+        )
+    
+    - name: Show disk usage
+      shell: cmd
+      run: |
+        echo ""
+        echo "========================================"
+        echo "Disk usage after cleanup:"
+        echo "========================================"
+        docker system df
+        echo "========================================"

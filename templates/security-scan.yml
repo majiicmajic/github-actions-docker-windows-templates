@@ -1,0 +1,74 @@
+# templates/security-scan.yml
+# Security scanning for Docker images
+
+name: Security Scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 10 * * *'  # Daily at 10 AM
+  workflow_dispatch:
+
+jobs:
+  vulnerability-scan:
+    name: Vulnerability Scan
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Install Trivy
+        shell: cmd
+        run: choco install trivy -y
+      
+      - name: Build image
+        shell: cmd
+        run: docker build -t scan-target:latest .
+      
+      - name: Run Trivy scan
+        shell: cmd
+        run: |
+          trivy image --severity HIGH,CRITICAL --exit-code 0 --format sarif --output trivy-results.sarif scan-target:latest
+      
+      - name: Upload scan results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+      
+      - name: Run Docker Scout
+        uses: docker/scout-action@v1
+        with:
+          command: quickview
+          only-severities: critical,high
+  
+  secret-scan:
+    name: Secret Scanning
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  
+  dependency-scan:
+    name: Dependency Scanning
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
